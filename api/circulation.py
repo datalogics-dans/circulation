@@ -11,7 +11,6 @@ from flask.ext.babel import lazy_gettext as _
 from core.analytics import Analytics
 from core.model import (
     get_one,
-    CirculationEvent,
     Identifier,
     DataSource,
     LicensePool,
@@ -100,12 +99,15 @@ class CirculationAPI(object):
     between different circulation APIs.
     """
 
-    def __init__(self, _db, overdrive=None, threem=None, axis=None):
+    CIRCULATION_MANAGER_INITIATED_LOAN_EVENT_TYPE = "circulation_manager_check_out"
+    
+    def __init__(self, _db, overdrive=None, threem=None, axis=None, theta=None):
         self._db = _db
         self.overdrive = overdrive
         self.threem = threem
         self.axis = axis
-        self.apis = [x for x in (overdrive, threem, axis) if x]
+        self.theta = theta
+        self.apis = [x for x in (overdrive, threem, axis, theta) if x]
         self.log = logging.getLogger("Circulation API")
 
         # When we get our view of a patron's loans and holds, we need
@@ -125,16 +127,14 @@ class CirculationAPI(object):
             data_sources_for_sync.append(
                 DataSource.lookup(_db, DataSource.AXIS_360)
             )
+        if self.theta:
+            data_sources_for_sync.append(
+                DataSource.lookup(_db, DataSource.THETA)
+            )
 
-
-        h = dict()
-        for ds in data_sources_for_sync:
-            type = ds.primary_identifier_type 
-            h[type] = ds.name
-            if type in Identifier.DEPRECATED_NAMES:
-                new_name = Identifier.DEPRECATED_NAMES[type]
-                h[new_name] = ds.name
-        self.identifier_type_to_data_source_name = h
+        self.identifier_type_to_data_source_name = dict(
+            (ds.primary_identifier_type, ds.name) 
+            for ds in data_sources_for_sync)
         self.data_source_ids_for_sync = [
             x.id for x in data_sources_for_sync
         ]
@@ -147,6 +147,8 @@ class CirculationAPI(object):
             api = self.threem
         elif licensepool.data_source.name==DataSource.AXIS_360:
             api = self.axis
+        elif licensepool.data_source.name==DataSource.THETA:
+            api = self.theta
         else:
             return None
 
@@ -176,6 +178,7 @@ class CirculationAPI(object):
         if licensepool.open_access:
             # We can 'loan' open-access content ourselves just by
             # putting a row in the database.
+            print "\nXXXXXXX this book is open access\n"
             now = datetime.datetime.utcnow()
             __transaction = self._db.begin_nested()
             loan, is_new = licensepool.loan_to(patron, start=now, end=None)
@@ -200,9 +203,14 @@ class CirculationAPI(object):
         internal_format = api.internal_format(delivery_mechanism)
 
         if patron.fines:
-            max_fines = Configuration.max_outstanding_fines()
-            if patron.fines >= max_fines.amount:
-                raise OutstandingFines()
+            def parse_fines(fines):
+                dollars, cents = re.match("\$([\d]+)\.(\d\d)", fines).groups()
+                return (dollars * 100) + cents
+
+            max_fines = Configuration.policy(Configuration.MAX_OUTSTANDING_FINES)
+            if max_fines:
+                if parse_fines(patron.fines) >= parse_fines(max_fines):
+                    raise OutstandingFines()
 
         # Do we (think we) already have this book out on loan?
         existing_loan = get_one(
@@ -304,7 +312,7 @@ class CirculationAPI(object):
                 # manager.
                 Analytics.collect_event(
                     self._db, licensepool,
-                    CirculationEvent.CM_CHECKOUT,
+                    self.CIRCULATION_MANAGER_INITIATED_LOAN_EVENT_TYPE
                 )
             return loan, None, new_loan_record
 
@@ -334,15 +342,6 @@ class CirculationAPI(object):
             hold_info.end_date, 
             hold_info.hold_position
         )
-        if hold and is_new:
-            # Send out an analytics event to record the fact that
-            # a hold was initiated through the circulation
-            # manager.
-            Analytics.collect_event(
-                self._db, licensepool,
-                CirculationEvent.CM_HOLD_PLACE,
-            )
-
         if existing_loan:
             self._db.delete(existing_loan)
         __transaction.commit()
@@ -395,15 +394,6 @@ class CirculationAPI(object):
                     fulfillment.content_link or fulfillment.content
             ):
                 raise NoAcceptableFormat()
-
-        # Send out an analytics event to record the fact that
-        # a fulfillment was initiated through the circulation
-        # manager.
-        Analytics.collect_event(
-            self._db, licensepool,
-            CirculationEvent.CM_FULFILL,
-        )
-
         # Make sure the delivery mechanism we just used is associated
         # with the loan.
         if loan.fulfillment is None and not delivery_mechanism.delivery_mechanism.is_streaming:
@@ -457,14 +447,6 @@ class CirculationAPI(object):
             logging.info("In revoke_loan(), deleting loan #%d" % loan.id)
             self._db.delete(loan)
             __transaction.commit()
-            # Send out an analytics event to record the fact that
-            # a loan was revoked through the circulation
-            # manager.
-            Analytics.collect_event(
-                self._db, licensepool,
-                CirculationEvent.CM_CHECKIN,
-            )
-
         if not licensepool.open_access:
             api = self.api_for_license_pool(licensepool)
             try:
@@ -497,15 +479,6 @@ class CirculationAPI(object):
             __transaction = self._db.begin_nested()
             self._db.delete(hold)
             __transaction.commit()
-
-            # Send out an analytics event to record the fact that
-            # a hold was revoked through the circulation
-            # manager.
-            Analytics.collect_event(
-                self._db, licensepool,
-                CirculationEvent.CM_HOLD_RELEASE,
-            )
-
         return True
 
     def patron_activity(self, patron, pin):
@@ -604,29 +577,11 @@ class CirculationAPI(object):
         local_loans_by_identifier = {}
         local_holds_by_identifier = {}
         for l in local_loans:
-            if not l.license_pool:
-                self.log.error("Active loan with no license pool!")
-                continue
             i = l.license_pool.identifier
-            if not i:
-                self.log.error(
-                    "Active loan on license pool %s, which has no identifier!",
-                    l.license_pool
-                )
-                continue
             key = (i.type, i.identifier)
             local_loans_by_identifier[key] = l
         for h in local_holds:
-            if not h.license_pool:
-                self.log.error("Active hold with no license pool!")
-                continue
             i = h.license_pool.identifier
-            if not i:
-                self.log.error(
-                    "Active hold on license pool %r, which has no identifier!",
-                    h.license_pool
-                )
-                continue
             key = (i.type, i.identifier)
             local_holds_by_identifier[key] = h
 
