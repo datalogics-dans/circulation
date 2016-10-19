@@ -43,6 +43,8 @@ class Configuration(CoreConfiguration):
     OAUTH_TOKEN_EXPIRATION_DAYS = 'token_expiration_days'
     SECRET_KEY = "secret_key"
 
+    EVERGREEN_INTEGRATION = "Evergreen"
+
     MILLENIUM_INTEGRATION = "Millenium"
     AUTHORIZATION_IDENTIFIER_BLACKLIST = "authorization_identifier_blacklist"
     STAFF_PICKS_INTEGRATION = "Staff Picks"
