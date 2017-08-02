@@ -1645,6 +1645,7 @@ class TestSettingsController(AdminControllerTest):
                 ("username", "username"),
                 ("password", "password"),
                 ("website_id", "1234"),
+                ("ils_name", "the_ils"),
                 ("default_loan_period", "14"),
                 ("default_reservation_period", "3"),
             ])
@@ -1722,6 +1723,7 @@ class TestSettingsController(AdminControllerTest):
                 ("username", "user2"),
                 ("password", "password"),
                 ("website_id", "1234"),
+                ("ils_name", "the_ils"),
                 ("libraries", json.dumps([{"short_name": "L1"}])),
                 ("default_loan_period", "14"),
                 ("default_reservation_period", "3"),
